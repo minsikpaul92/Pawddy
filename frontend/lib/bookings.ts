@@ -593,12 +593,20 @@ export function sitterBucket(b: BookingSummary): "requests" | "upcoming" | "past
 
 const SOON_MS = 48 * 3_600_000;
 
-/** Which sitter segment to open on: a stay in care or starting within 48 h → Upcoming; else Requests if any; else Upcoming if any. */
-export function firstSitterBucket(bookings: BookingSummary[], now = Date.now()): "requests" | "upcoming" | "past" {
+/**
+ * Which sitter segment to open on: a stay in care or starting within 48 h → Upcoming; else open Requests; else
+ * Questions waiting for an answer; else Upcoming if any.
+ */
+export function firstSitterBucket(
+  bookings: BookingSummary[],
+  now = Date.now(),
+  waitingQuestions = 0,
+): "requests" | "inquiries" | "upcoming" | "past" {
   const upcoming = bookings.filter((b) => sitterBucket(b) === "upcoming");
   const soon = upcoming.some((b) => !!b.dropOff && (!!b.dropOff.completedAt || Date.parse(b.dropOff.at) - now <= SOON_MS));
   if (soon) return "upcoming";
   if (bookings.some((b) => sitterBucket(b) === "requests")) return "requests";
+  if (waitingQuestions > 0) return "inquiries";
   return upcoming.length > 0 ? "upcoming" : "requests";
 }
 

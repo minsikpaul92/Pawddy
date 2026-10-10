@@ -9,6 +9,7 @@ import { EmptyState } from "../../../components/ui/EmptyState";
 import { LoadingView } from "../../../components/ui/LoadingView";
 import { Screen } from "../../../components/ui/Screen";
 import { caringPetsFromBookings, isCaring } from "../../../features/feed/caringPets";
+import { SitterInquiryCard, listSitterInquiries } from "../../../features/inquiries/inquiryApi";
 import { SPECIES_EMOJI } from "../../../features/pets/petFormat";
 import { appToday, formatInstant, formatTime, isoToZoned } from "../../../features/schedule/dates";
 import { BookingSummary, HandoffKind, listSitterBookings } from "../../../lib/bookings";
@@ -19,7 +20,7 @@ import { Theme } from "../../../theme/themes";
 
 type State =
   | { status: "loading" }
-  | { status: "ready"; bookings: BookingSummary[] }
+  | { status: "ready"; bookings: BookingSummary[]; inquiries: SitterInquiryCard[] }
   | { status: "error"; message: string };
 
 type Due = { booking: BookingSummary; kind: HandoffKind; at: string };
@@ -40,7 +41,11 @@ export default function SitterHome() {
   const load = useCallback(async () => {
     if (!sitterId) return;
     try {
-      setState({ status: "ready", bookings: await listSitterBookings(sitterId) });
+      const [bookings, inquiries] = await Promise.all([
+        listSitterBookings(sitterId),
+        listSitterInquiries().catch(() => [] as SitterInquiryCard[]),
+      ]);
+      setState({ status: "ready", bookings, inquiries });
     } catch (error) {
       setState({ status: "error", message: (error as Error).message });
     }
@@ -72,6 +77,8 @@ export default function SitterHome() {
   const today = appToday();
   const confirmed = state.bookings.filter((b) => b.status === "confirmed");
   const requests = state.bookings.filter((b) => b.status === "requested").length;
+  // Questions an owner asked that still need the sitter's answer (a new owner message counts again, FB-34).
+  const questions = state.inquiries.filter((i) => i.status === "open" && i.state !== "replied").length;
   const caring = confirmed.filter((b) => isCaring(b, now));
   const due: Due[] = confirmed
     .flatMap((b) =>
@@ -86,7 +93,7 @@ export default function SitterHome() {
     .sort((a, b) => (a.dropOff?.at ?? "").localeCompare(b.dropOff?.at ?? ""))
     .slice(0, 5);
 
-  if (requests === 0 && caring.length === 0 && due.length === 0 && upcoming.length === 0) {
+  if (requests === 0 && questions === 0 && caring.length === 0 && due.length === 0 && upcoming.length === 0) {
     return (
       <Screen>
         <EmptyState
@@ -112,6 +119,17 @@ export default function SitterHome() {
           testID="today-requests"
         >
           <Text style={styles.requestsText}>{`📬 Requests (${requests}) — tap to answer`}</Text>
+        </Pressable>
+      ) : null}
+
+      {questions > 0 ? (
+        <Pressable
+          accessibilityRole="button"
+          onPress={() => router.push("/sitter/bookings")}
+          style={({ pressed }) => [styles.requests, pressed && styles.pressed]}
+          testID="today-questions"
+        >
+          <Text style={styles.requestsText}>{`💬 Questions (${questions}) — tap to answer`}</Text>
         </Pressable>
       ) : null}
 

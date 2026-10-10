@@ -152,6 +152,13 @@ export function isoToZoned(iso: string): { day: string; time: string } {
   return zonedParts(new Date(iso));
 }
 
+/** A message or hand-off time: "Oct 10, 1:05 PM"; another year than this one adds it: "Oct 10, 2027, 1:05 PM". */
+export function formatStamp(iso: string, now: Date = new Date()): string {
+  const { day, time } = isoToZoned(iso);
+  const year = day.slice(0, 4) === appToday(now).slice(0, 4) ? "" : `, ${day.slice(0, 4)}`;
+  return `${formatDay(day)}${year}, ${formatTime(time)}`;
+}
+
 /** ISO instant → "Oct 5, 9:30 AM" in the app timezone. */
 export function formatInstant(iso: string): string {
   const { day, time } = isoToZoned(iso);

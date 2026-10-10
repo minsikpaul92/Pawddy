@@ -141,6 +141,8 @@ export async function mockSupabase(page: Page, initialUsers: MockUser[], options
 type Row = Record<string, unknown>;
 
 export type MockDb = {
+  /** rpc/stay_capacity_check answer: null = the stay fits. */
+  stayShortfall?: string | null;
   pets: Row[];
   pet_allergies: Row[];
   owner_profiles: Row[];
@@ -1058,13 +1060,16 @@ async function handleRest(route: Route, users: MockUser[], db: MockDb) {
 
   if (path === "rpc/send_inquiry_reply") {
     // 010b: only the thread's sitter; quote / sources / can_host are copied from the draft, nothing else.
-    const { p_inquiry, p_body, p_draft } = request.postDataJSON();
+    const { p_inquiry, p_body, p_draft, p_outcome } = request.postDataJSON();
     const inquiry = db.inquiries.find((i) => i.id === p_inquiry);
     if (!inquiry || inquiry.sitter_id !== me) return json(route, 400, { code: "P0001", message: "forbidden" });
     const body = String(p_body ?? "").trim();
     if (!body) return json(route, 400, { code: "P0001", message: "body_required" });
     let grounding: Row | null = null;
-    if (p_draft) {
+    if (p_outcome === "decline" || p_outcome === "suggest") {
+      // 011k: a decline / suggestion can't host and carries no quote.
+      grounding = { availability: { can_host: false } };
+    } else if (p_draft) {
       const draft = db.inquiry_messages.find((m) => m.id === p_draft && m.inquiry_id === p_inquiry && m.author === "ai");
       if (!draft) return json(route, 400, { code: "P0001", message: "draft_not_found" });
       const g = (draft.grounding ?? {}) as Row;
@@ -1090,6 +1095,30 @@ async function handleRest(route: Route, users: MockUser[], db: MockDb) {
       pet_id: null, booking_id: null, ref_id: p_inquiry, read_at: null, created_at: row.created_at,
     });
     return json(route, 200, row);
+  }
+
+  if (path === "rpc/change_inquiry_dates") {
+    // 011j: the owner's own open inquiry only; one owner message records the change.
+    const { p_inquiry, p_drop_off_at, p_pick_up_at, p_drop_off_place, p_pick_up_place, p_body } = request.postDataJSON();
+    const inquiry = db.inquiries.find((i) => i.id === p_inquiry);
+    if (!inquiry || inquiry.owner_id !== me) return json(route, 400, { code: "P0001", message: "forbidden" });
+    if (inquiry.status !== "open") return json(route, 400, { code: "P0001", message: "inquiry_closed" });
+    if (!(Date.parse(p_pick_up_at) > Date.parse(p_drop_off_at))) return json(route, 400, { code: "P0001", message: "invalid_window" });
+    inquiry.drop_off_at = p_drop_off_at;
+    inquiry.pick_up_at = p_pick_up_at;
+    if (p_drop_off_place) inquiry.drop_off_location_type = p_drop_off_place;
+    if (p_pick_up_place) inquiry.pick_up_location_type = p_pick_up_place;
+    const row = {
+      id: crypto.randomUUID(), inquiry_id: p_inquiry, author: "owner", sender_id: me, body: String(p_body), grounding: null,
+      drafted_by_ai: false, status: "sent", visible_at: new Date().toISOString(), read_at: null, created_at: new Date().toISOString(),
+    };
+    db.inquiry_messages.push(row);
+    return json(route, 200, row);
+  }
+
+  if (path === "rpc/stay_capacity_check") {
+    // 011c: null = fits; a spec sets `db.stayShortfall` to see the refusal.
+    return json(route, 200, db.stayShortfall ?? null);
   }
 
   if (path === "rpc/get_my_ai_reply_mode" || path === "rpc/set_ai_reply_mode") {

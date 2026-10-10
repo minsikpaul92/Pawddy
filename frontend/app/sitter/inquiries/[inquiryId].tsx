@@ -2,6 +2,7 @@ import { Stack, useLocalSearchParams } from "expo-router";
 import { useCallback, useEffect, useState } from "react";
 import { StyleSheet, Text, View } from "react-native";
 
+import { InquiryReplySheet, ReplyKind } from "../../../components/InquiryReplySheet";
 import { MessageBubble } from "../../../components/MessageBubble";
 import { QuoteCard } from "../../../components/QuoteCard";
 import { Button } from "../../../components/ui/Button";
@@ -14,7 +15,6 @@ import { TextButton } from "../../../components/ui/TextButton";
 import { TextField } from "../../../components/ui/TextField";
 import {
   InquiryView,
-  ReplyIntent,
   getInquiry,
   markInquiryRead,
   recordReplySample,
@@ -22,17 +22,17 @@ import {
   sendInquiryReply,
   tripSummary,
 } from "../../../features/inquiries/inquiryApi";
-import { formatTime, isoToZoned } from "../../../features/schedule/dates";
+import { useLiveThread } from "../../../features/inquiries/useLiveThread";
+import { formatStamp } from "../../../features/schedule/dates";
 import { useErrorDialog } from "../../../providers/ErrorDialogProvider";
 import { useThemedStyles } from "../../../providers/ThemeProvider";
 import { useToast } from "../../../providers/ToastProvider";
 import { Theme } from "../../../theme/themes";
 
-const POLL_MS = 3000;
-const INTENTS: { value: ReplyIntent; label: string }[] = [
+const QUICK: { value: ReplyKind; label: string }[] = [
   { value: "accept", label: "Accept" },
   { value: "decline", label: "Decline" },
-  { value: "suggest_dates", label: "Suggest other dates" },
+  { value: "suggest", label: "Suggest other dates" },
 ];
 
 /**
@@ -50,6 +50,7 @@ export default function SitterInquiry() {
   const [editing, setEditing] = useState(false);
   const [text, setText] = useState("");
   const [busy, setBusy] = useState<"send" | "regenerate" | null>(null);
+  const [quick, setQuick] = useState<ReplyKind | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -65,14 +66,15 @@ export default function SitterInquiry() {
     void markInquiryRead(inquiryId); // opening the thread is the only "read" the owner ever sees
   }, [load, inquiryId]);
 
-  const replied = !!inquiry?.messages.some((m) => m.author === "sitter");
+  // Judged from the LATEST message: a new owner message after the reply needs an answer again (FB-34).
+  const replied = inquiry?.messages.at(-1)?.author === "sitter";
   const draft = inquiry?.draft ?? null;
-  // Waiting for the draft: a slow poll until it arrives.
+  useLiveThread(inquiryId, load);
+  // The owner's newest message is read the moment it is on this screen (the only read mark there is).
+  const unread = inquiry?.messages.some((m) => m.author === "owner" && !m.readAt) ?? false;
   useEffect(() => {
-    if (!inquiry || draft || replied) return;
-    const timer = setInterval(() => void load(), POLL_MS);
-    return () => clearInterval(timer);
-  }, [inquiry, draft, replied, load]);
+    if (unread) void markInquiryRead(inquiryId);
+  }, [unread, inquiryId]);
 
   // A fresh draft replaces whatever was being edited.
   useEffect(() => {
@@ -98,7 +100,7 @@ export default function SitterInquiry() {
     );
   }
 
-  const when = (at: string) => `${isoToZoned(at).day.slice(5)} ${formatTime(isoToZoned(at).time)}`;
+  const when = formatStamp;
   const question = inquiry.messages.filter((m) => m.author === "owner").at(-1);
 
   const send = async () => {
@@ -116,12 +118,13 @@ export default function SitterInquiry() {
     }
   };
 
-  const regenerate = async (intent?: ReplyIntent) => {
+  const regenerate = async () => {
     if (busy) return;
     setBusy("regenerate");
     try {
-      await regenerateDraft(inquiry.id, intent);
+      await regenerateDraft(inquiry.id);
       await load();
+      toast.show("New draft ready ✍️");
     } catch (e) {
       errorDialog.show({ title: "No new draft", message: (e as Error).message });
     } finally {
@@ -153,12 +156,15 @@ export default function SitterInquiry() {
         <Text style={styles.muted} testID="inquiry-replied">{`You replied. ${inquiry.ownerName} was told.`}</Text>
       ) : draft || editing ? (
         <Card style={styles.draft} testID="inquiry-draft">
-          <Text style={styles.warning} testID="inquiry-warning">
-            AI drafts can be wrong. You're responsible for what you send.
-          </Text>
           {draft?.needsSitter ? (
             <Text style={styles.check} testID="inquiry-needs-you">
               ⚠️ Check this one — something needs your confirmation.
+            </Text>
+          ) : null}
+          {draft?.canHost === false ? (
+            <Text style={styles.noRoom} testID="inquiry-no-room">
+              📅 Your calendar has no room for these dates, so a draft can't say yes. Open the days in your schedule and tap
+              Regenerate, decline, or suggest other dates.
             </Text>
           ) : null}
           {editing ? (
@@ -182,6 +188,9 @@ export default function SitterInquiry() {
             onPress={() => void send()}
             testID="inquiry-send"
           />
+          <Text style={styles.warning} testID="inquiry-warning">
+            AI drafts can be wrong. You're responsible for what you send.
+          </Text>
           <View style={styles.row}>
             <TextButton
               label={editing ? "Use the draft text" : "Edit / Add"}
@@ -198,16 +207,16 @@ export default function SitterInquiry() {
               testID="inquiry-regenerate"
             />
           </View>
-          <Text style={styles.label}>Lean the draft</Text>
+          <Text style={styles.label}>Or reply with</Text>
           <View style={styles.row}>
-            {INTENTS.map((i) => (
+            {QUICK.map((q) => (
               <Button
-                key={i.value}
-                label={i.label}
+                key={q.value}
+                label={q.label}
                 variant="secondary"
                 disabled={busy != null}
-                onPress={() => void regenerate(i.value)}
-                testID={`inquiry-intent-${i.value}`}
+                onPress={() => setQuick(q.value)}
+                testID={`inquiry-intent-${q.value}`}
               />
             ))}
           </View>
@@ -218,6 +227,7 @@ export default function SitterInquiry() {
           <TextButton label="Write it myself" onPress={() => setEditing(true)} testID="inquiry-write-myself" />
         </Card>
       )}
+      <InquiryReplySheet kind={quick} inquiry={inquiry} draft={draft} onClose={() => setQuick(null)} onSent={() => void load()} />
     </Screen>
   );
 }
@@ -229,7 +239,8 @@ const makeStyles = (theme: Theme) =>
     tripTitle: { fontSize: theme.fontSize.body, fontWeight: "700", color: theme.color.text },
     muted: { fontSize: theme.fontSize.small, color: theme.color.textMuted },
     draft: { gap: theme.spacing.sm },
-    warning: { fontSize: theme.fontSize.small, fontWeight: "600", color: theme.color.textMuted },
+    warning: { fontSize: theme.fontSize.caption, color: theme.color.textMuted, textAlign: "center" },
+    noRoom: { fontSize: theme.fontSize.small, color: theme.color.textMuted },
     check: { fontSize: theme.fontSize.small, fontWeight: "700", color: theme.color.warning },
     body: { fontSize: theme.fontSize.body, color: theme.color.text },
     label: { fontSize: theme.fontSize.small, fontWeight: "600", color: theme.color.textMuted },

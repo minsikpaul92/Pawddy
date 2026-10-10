@@ -70,6 +70,11 @@ export type InquiryDraft = {
   intent: string | null;
 };
 
+/** What the answer stood on, as chips. The owner's own earlier messages are context, not a source worth showing. */
+function shownSources(sources: InquirySource[] | undefined): InquirySource[] {
+  return (sources ?? []).filter((s) => s.type !== "inquiry");
+}
+
 type Embed<T> = T | T[] | null;
 const first = <T,>(v: Embed<T>): T | null => (Array.isArray(v) ? (v[0] ?? null) : v);
 
@@ -121,6 +126,20 @@ export async function requestInquiryReply(inquiryId: string): Promise<boolean> {
     if (!(error instanceof ApiError)) return false;
     return false;
   }
+}
+
+/** Owner: a follow-up in an open thread. RLS lets the owner insert only their own message; the draft is asked for next. */
+export async function sendOwnerMessage(inquiryId: string, body: string): Promise<void> {
+  const supabase = getSupabase();
+  const { data: sessionData } = await supabase.auth.getSession();
+  const ownerId = sessionData.session?.user.id;
+  if (!ownerId) throw new Error("Sign in to continue.");
+  const text = body.trim();
+  if (!text) throw new Error("Write something before sending.");
+  const { error } = await supabase
+    .from("inquiry_messages")
+    .insert({ inquiry_id: inquiryId, author: "owner", sender_id: ownerId, body: text.slice(0, 2000) });
+  if (error) fail("send your message");
 }
 
 type MessageRow = {
@@ -208,7 +227,7 @@ export async function getInquiry(id: string): Promise<InquiryView | null> {
         body: m.body,
         at: m.created_at,
         quote: m.grounding?.quote ?? null,
-        sources: m.grounding?.sources ?? [],
+        sources: shownSources(m.grounding?.sources),
         canHost: m.grounding?.availability?.can_host ?? null,
         readAt: m.read_at,
         auto: m.author === "sitter" && m.drafted_by_ai && !m.confirmed_by_sitter_at,
@@ -217,16 +236,20 @@ export async function getInquiry(id: string): Promise<InquiryView | null> {
   };
 }
 
+/** The draft the sitter still has to act on: it answers the owner's latest message and no sent reply came after it. */
 function latestDraft(rows: MessageRow[]): InquiryDraft | null {
-  const drafts = rows.filter((m) => m.author === "ai");
-  const m = drafts[drafts.length - 1];
+  const m = rows.filter((r) => r.author === "ai").at(-1);
   if (!m) return null;
+  const lastOwner = rows.filter((r) => r.author === "owner").at(-1);
+  const lastSitter = rows.filter((r) => r.author === "sitter").at(-1);
+  if (lastOwner && lastOwner.created_at > m.created_at) return null;
+  if (lastSitter && lastSitter.created_at > m.created_at) return null;
   return {
     id: m.id,
     body: m.body,
     at: m.created_at,
     quote: m.grounding?.quote ?? null,
-    sources: m.grounding?.sources ?? [],
+    sources: shownSources(m.grounding?.sources),
     canHost: m.grounding?.availability?.can_host ?? null,
     needsSitter: !!m.grounding?.needs_sitter,
     intent: m.grounding?.intent ?? null,
@@ -245,14 +268,65 @@ export async function regenerateDraft(inquiryId: string, intent?: ReplyIntent): 
   }
 }
 
-/** Sitter: send the text they approved (the draft as is, or their edit). `draftId` keeps the quote and sources. */
-export async function sendInquiryReply(inquiryId: string, body: string, draftId: string | null): Promise<void> {
-  const { error } = await getSupabase().rpc("send_inquiry_reply", { p_inquiry: inquiryId, p_body: body, p_draft: draftId });
+export type ReplyOutcome = "accept" | "decline" | "suggest";
+
+/**
+ * Sitter: send the text they approved (the draft as is, or their edit). `draftId` keeps the quote and sources.
+ * `outcome` says what the reply is: a decline or a suggestion can't host and carries no quote (011k).
+ */
+export async function sendInquiryReply(
+  inquiryId: string,
+  body: string,
+  draftId: string | null,
+  outcome?: ReplyOutcome,
+): Promise<void> {
+  const { error } = await getSupabase().rpc("send_inquiry_reply", {
+    p_inquiry: inquiryId,
+    p_body: body,
+    p_draft: draftId,
+    ...(outcome ? { p_outcome: outcome } : {}),
+  });
   if (!error) return;
   if (error.message.includes("body_required")) throw new Error("Write something before sending.");
   if (error.message.includes("body_too_long")) throw new Error("Keep the reply under 2000 characters.");
   if (error.message.includes("inquiry_closed")) throw new Error("The owner closed this question.");
   fail("send the reply");
+}
+
+/** Owner: new dates in the same thread (011j). One owner message records the change; ask for the new draft next. */
+export async function changeInquiryDates(input: {
+  inquiryId: string;
+  dropOff: { at: string; locationType: LocationType };
+  pickUp: { at: string; locationType: LocationType };
+  body: string;
+}): Promise<void> {
+  const { error } = await getSupabase().rpc("change_inquiry_dates", {
+    p_inquiry: input.inquiryId,
+    p_drop_off_at: input.dropOff.at,
+    p_pick_up_at: input.pickUp.at,
+    p_drop_off_place: input.dropOff.locationType,
+    p_pick_up_place: input.pickUp.locationType,
+    p_body: input.body.slice(0, 2000),
+  });
+  if (!error) return;
+  if (error.message.includes("invalid_window")) throw new Error("Check the dates — a stay can be up to 31 days.");
+  if (error.message.includes("inquiry_closed")) throw new Error("This question is closed. Start a new one.");
+  fail("change the dates");
+}
+
+/**
+ * The booking engine's own answer for a stay at this sitter (null = it fits). The sitter checks the dates they
+ * are about to suggest, so a suggestion is never one the owner can't book.
+ */
+export async function stayShortfall(sitterId: string, dropOffAt: string, pickUpAt: string, petCount: number): Promise<string | null> {
+  const { data, error } = await getSupabase().rpc("stay_capacity_check", {
+    p_sitter: sitterId,
+    p_drop_off_at: dropOffAt,
+    p_pick_up_at: pickUpAt,
+    p_pet_count: petCount,
+  });
+  if (error) return null; // can't check: don't block the sitter
+  return (data as string | null) ?? null;
 }
 
 /** After a send: let the assistant learn from what the sitter did with the draft. Never blocks or fails. */
@@ -282,6 +356,14 @@ export type SitterInquiryCard = {
   state: "waiting" | "draft" | "replied";
 };
 
+/** Where a thread stands, judged from the owner's LATEST message: a reply or draft older than it doesn't count (FB-34). */
+export function threadState(list: { author: string; created_at: string }[]): SitterInquiryCard["state"] {
+  const latest = (author: string) => list.filter((m) => m.author === author).reduce((at, m) => (m.created_at > at ? m.created_at : at), "");
+  const owner = latest("owner");
+  if (latest("sitter") > owner) return "replied";
+  return latest("ai") > owner ? "draft" : "waiting";
+}
+
 /** The sitter's inquiries, newest first, each with where it stands. */
 export async function listSitterInquiries(): Promise<SitterInquiryCard[]> {
   const supabase = getSupabase();
@@ -304,7 +386,7 @@ export async function listSitterInquiries(): Promise<SitterInquiryCard[]> {
   }
   return rows.map((r) => {
     const list = byInquiry.get(r.id) ?? [];
-    const replied = list.some((m) => m.author === "sitter");
+    const state = threadState(list);
     return {
       id: r.id,
       ownerName: first(r.owner)?.display_name ?? "An owner",
@@ -314,7 +396,7 @@ export async function listSitterInquiries(): Promise<SitterInquiryCard[]> {
       pickUpAt: r.pick_up_at,
       createdAt: r.created_at,
       status: r.status,
-      state: replied ? "replied" : list.some((m) => m.author === "ai") ? "draft" : "waiting",
+      state,
     };
   });
 }
@@ -349,11 +431,14 @@ export async function listOwnerInquiries(): Promise<OwnerInquiryCard[]> {
   const rows = (found.data ?? []) as unknown as InquiryRow[];
   if (rows.length === 0) return [];
   const [msgs, pets] = await Promise.all([
-    supabase.from("inquiry_messages").select("inquiry_id, author").eq("author", "sitter").in("inquiry_id", rows.map((r) => r.id)),
+    supabase.from("inquiry_messages").select("inquiry_id, author, created_at").in("inquiry_id", rows.map((r) => r.id)),
     supabase.from("pets").select("id, name").in("id", [...new Set(rows.flatMap((r) => r.pet_ids))]),
   ]);
   const names = new Map(((pets.data ?? []) as { id: string; name: string }[]).map((p) => [p.id, p.name]));
-  const replied = new Set(((msgs.data ?? []) as { inquiry_id: string }[]).map((m) => m.inquiry_id));
+  const byInquiry = new Map<string, { author: string; created_at: string }[]>();
+  for (const m of (msgs.data ?? []) as { inquiry_id: string; author: string; created_at: string }[]) {
+    byInquiry.set(m.inquiry_id, [...(byInquiry.get(m.inquiry_id) ?? []), m]);
+  }
   return rows.map((r) => ({
     id: r.id,
     sitterName: first(r.sitter)?.display_name ?? "Your sitter",
@@ -363,6 +448,6 @@ export async function listOwnerInquiries(): Promise<OwnerInquiryCard[]> {
     pickUpAt: r.pick_up_at,
     createdAt: r.created_at,
     status: r.status,
-    state: replied.has(r.id) ? "replied" : "waiting",
+    state: threadState(byInquiry.get(r.id) ?? []) === "replied" ? "replied" : "waiting",
   }));
 }

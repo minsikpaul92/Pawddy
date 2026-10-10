@@ -54,32 +54,36 @@ export default function SitterBookings() {
   const sitterId = profile?.id;
   const [state, setState] = useState<State>({ status: "loading" });
   const [bucket, setBucket] = useState<Bucket>("requests");
-  const picked = useRef(false);
+  const userPicked = useRef(false);
 
-  const load = useCallback(async () => {
-    if (!sitterId) return;
-    try {
-      const [bookings, inquiries] = await Promise.all([
-        listSitterBookings(sitterId),
-        listSitterInquiries().catch(() => [] as SitterInquiryCard[]),
-      ]);
-      setState({ status: "ready", bookings, inquiries });
-      // Open on what matters most, once: a stay that is on or about to start, else open requests (the
-      // Requests count stays on its tab). Never override a tab the sitter picked themselves.
-      if (!picked.current) {
-        picked.current = true;
-        setBucket(firstSitterBucket(bookings));
+  // `open` = choose the tab to land on (when the sitter arrives); a refresh in place never moves them.
+  const load = useCallback(
+    async (open = false) => {
+      if (!sitterId) return;
+      try {
+        const [bookings, inquiries] = await Promise.all([
+          listSitterBookings(sitterId),
+          listSitterInquiries().catch(() => [] as SitterInquiryCard[]),
+        ]);
+        setState({ status: "ready", bookings, inquiries });
+        // Open on what needs the sitter most: a stay on or about to start, else open requests, else questions
+        // waiting for an answer. Never override a tab the sitter picked themselves.
+        if (open && !userPicked.current) {
+          const waiting = inquiries.filter((i) => i.status === "open" && i.state !== "replied").length;
+          setBucket(firstSitterBucket(bookings, Date.now(), waiting));
+        }
+      } catch (error) {
+        setState({ status: "error", message: (error as Error).message });
       }
-    } catch (error) {
-      setState({ status: "error", message: (error as Error).message });
-    }
-  }, [sitterId]);
+    },
+    [sitterId],
+  );
 
   useOnBookingChange(() => void load());
 
   useFocusEffect(
     useCallback(() => {
-      void load();
+      void load(true);
     }, [load]),
   );
 
@@ -115,7 +119,10 @@ export default function SitterBookings() {
           { value: "past", label: "Past" },
         ]}
         value={bucket}
-        onChange={setBucket}
+        onChange={(next) => {
+          userPicked.current = true;
+          setBucket(next);
+        }}
         testID="sitter-bookings-tabs"
       />
       {empty ? (

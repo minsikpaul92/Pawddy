@@ -10,12 +10,22 @@ import { Chip } from "../../../components/ui/Chip";
 import { EmptyState } from "../../../components/ui/EmptyState";
 import { LoadingView } from "../../../components/ui/LoadingView";
 import { Screen } from "../../../components/ui/Screen";
-import { InquiryView, getInquiry, tripSummary } from "../../../features/inquiries/inquiryApi";
-import { formatTime, isoToZoned } from "../../../features/schedule/dates";
+import { InquirySheet } from "../../../components/InquirySheet";
+import { TextButton } from "../../../components/ui/TextButton";
+import { TextField } from "../../../components/ui/TextField";
+import {
+  InquiryView,
+  getInquiry,
+  requestInquiryReply,
+  sendOwnerMessage,
+  tripSummary,
+} from "../../../features/inquiries/inquiryApi";
+import { useLiveThread } from "../../../features/inquiries/useLiveThread";
+import { SitterSummary, getSitterProfile } from "../../../features/sitters/sitterApi";
+import { useErrorDialog } from "../../../providers/ErrorDialogProvider";
+import { formatStamp } from "../../../features/schedule/dates";
 import { useThemedStyles } from "../../../providers/ThemeProvider";
 import { Theme } from "../../../theme/themes";
-
-const POLL_MS = 3000;
 
 /**
  * The owner's side of one inquiry (phase-07B 7B.5): their question, then the sitter's reply — shown as the
@@ -27,6 +37,11 @@ export default function OwnerInquiry() {
   const { inquiryId } = useLocalSearchParams<{ inquiryId: string }>();
   const [inquiry, setInquiry] = useState<InquiryView | null | undefined>(undefined);
   const [error, setError] = useState<string | null>(null);
+  const errorDialog = useErrorDialog();
+  const [text, setText] = useState("");
+  const [sending, setSending] = useState(false);
+  const [changing, setChanging] = useState(false);
+  const [sitter, setSitter] = useState<SitterSummary | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -37,12 +52,21 @@ export default function OwnerInquiry() {
     }
   }, [inquiryId]);
 
-  const reply = inquiry?.messages.find((m) => m.author === "sitter");
+  // The thread's state is the LAST message: the sitter's reply is the one on screen until the owner writes again.
+  const last = inquiry?.messages.at(-1);
+  const reply = last?.author === "sitter" ? last : undefined;
+  const sitterId = inquiry?.sitterId;
+  useEffect(() => {
+    if (!sitterId) return;
+    getSitterProfile(sitterId)
+      .then(setSitter)
+      .catch(() => undefined);
+  }, [sitterId]);
   // Auto-send: "typing…" between the two times the server stored, then the message itself (RLS shows it from then on).
   const [now, setNow] = useState(() => Date.now());
   const typingAt = inquiry?.replyTypingAt ? Date.parse(inquiry.replyTypingAt) : null;
   const visibleAt = inquiry?.replyVisibleAt ? Date.parse(inquiry.replyVisibleAt) : null;
-  const scheduled = !reply && visibleAt != null && visibleAt > now;
+  const scheduled = !!last && !reply && visibleAt != null && visibleAt > now;
   const typing = scheduled && typingAt != null && now >= typingAt;
   useEffect(() => {
     if (!scheduled || visibleAt == null) return;
@@ -56,12 +80,7 @@ export default function OwnerInquiry() {
   useEffect(() => {
     void load();
   }, [load]);
-  // Wait for the sitter with a slow poll; stops once the reply is in.
-  useEffect(() => {
-    if (reply || inquiry === null) return;
-    const timer = setInterval(() => void load(), POLL_MS);
-    return () => clearInterval(timer);
-  }, [reply, inquiry, load]);
+  useLiveThread(inquiryId, load);
 
   if (error && inquiry === undefined) {
     return (
@@ -79,8 +98,21 @@ export default function OwnerInquiry() {
     );
   }
 
-  const question = inquiry.messages.find((m) => m.author === "owner");
-  const when = (at: string) => `${isoToZoned(at).day.slice(5)} ${formatTime(isoToZoned(at).time)}`;
+  const send = async () => {
+    if (sending || !text.trim()) return;
+    setSending(true);
+    try {
+      await sendOwnerMessage(inquiry.id, text);
+      setText("");
+      void requestInquiryReply(inquiry.id); // the thread keeps waiting for the sitter either way
+      await load();
+    } catch (e) {
+      errorDialog.show({ title: "Not sent", message: (e as Error).message, onRetry: () => void send() });
+    } finally {
+      setSending(false);
+    }
+  };
+  const when = formatStamp;
   const canHost = reply?.canHost !== false;
 
   return (
@@ -93,19 +125,23 @@ export default function OwnerInquiry() {
         <Text style={styles.muted}>{`Drop-off ${when(inquiry.dropOffAt)} · Pick-up ${when(inquiry.pickUpAt)}`}</Text>
       </Card>
 
-      {question ? <MessageBubble side="me" body={question.body} meta={question.readAt ? `${when(question.at)} · Read` : when(question.at)} testID="inquiry-question-bubble" /> : null}
+      {inquiry.messages.map((m) =>
+        m.author === "owner" ? (
+          <MessageBubble key={m.id} side="me" body={m.body} meta={m.readAt ? `${when(m.at)} · Read` : when(m.at)} testID="inquiry-question-bubble" />
+        ) : (
+          <MessageBubble key={m.id} side="them" body={m.body} meta={when(m.at)} testID="inquiry-reply-bubble">
+            {m.sources.length > 0 ? (
+              <View style={styles.sources} testID="inquiry-sources">
+                {[...new Set(m.sources.map((s) => s.label))].map((label) => (
+                  <Chip key={label} label={label} />
+                ))}
+              </View>
+            ) : null}
+          </MessageBubble>
+        ),
+      )}
 
-      {reply ? (
-        <MessageBubble side="them" body={reply.body} meta={when(reply.at)} testID="inquiry-reply-bubble">
-          {reply.sources.length > 0 ? (
-            <View style={styles.sources} testID="inquiry-sources">
-              {[...new Set(reply.sources.map((s) => s.label))].map((label) => (
-                <Chip key={label} label={label} />
-              ))}
-            </View>
-          ) : null}
-        </MessageBubble>
-      ) : (
+      {!reply ? (
         <View style={styles.waiting} testID="inquiry-waiting">
           {typing ? (
             <Text style={styles.typing} testID="inquiry-typing">{`${inquiry.sitterName} is typing…`}</Text>
@@ -116,7 +152,7 @@ export default function OwnerInquiry() {
             </>
           )}
         </View>
-      )}
+      ) : null}
 
       {reply?.quote && canHost ? <QuoteCard quote={reply.quote} testID="inquiry-quote" /> : null}
 
@@ -135,12 +171,51 @@ export default function OwnerInquiry() {
             testID="inquiry-request-booking"
           />
         ) : (
-          <Button
-            label="Find other sitters"
-            onPress={() => router.push(`/owner/bookings/new?inquiry=${inquiry.id}&other=1`)}
-            testID="inquiry-find-others"
-          />
+          <>
+            <Button label="Change dates" onPress={() => setChanging(true)} testID="inquiry-change-dates" />
+            <TextButton
+              label="Find other sitters"
+              onPress={() => router.push(`/owner/bookings/new?inquiry=${inquiry.id}&other=1`)}
+              testID="inquiry-find-others"
+            />
+          </>
         )
+      ) : null}
+
+      {inquiry.status === "open" && reply ? (
+        <View style={styles.compose} testID="inquiry-compose">
+          <TextField
+            label="Write back"
+            value={text}
+            multiline
+            maxLength={2000}
+            placeholder={`Ask ${inquiry.sitterName} something else`}
+            onChangeText={setText}
+            testID="inquiry-followup"
+          />
+          <Button
+            label={sending ? "Sending…" : "Send"}
+            variant={canHost ? "secondary" : "primary"}
+            disabled={sending || !text.trim()}
+            onPress={() => void send()}
+            testID="inquiry-followup-send"
+          />
+        </View>
+      ) : null}
+
+      {changing ? (
+        <InquirySheet
+          visible
+          onClose={() => setChanging(false)}
+          sitter={{ id: inquiry.sitterId, displayName: inquiry.sitterName, services: sitter?.services ?? [inquiry.serviceType] }}
+          change={{ inquiryId: inquiry.id, onChanged: () => void load() }}
+          prefill={{
+            serviceType: inquiry.serviceType,
+            petIds: inquiry.petIds,
+            dropOff: { at: inquiry.dropOffAt, locationType: inquiry.dropOffPlace },
+            pickUp: { at: inquiry.pickUpAt, locationType: inquiry.pickUpPlace },
+          }}
+        />
       ) : null}
     </Screen>
   );
@@ -153,6 +228,7 @@ const makeStyles = (theme: Theme) =>
     tripTitle: { fontSize: theme.fontSize.body, fontWeight: "700", color: theme.color.text },
     muted: { fontSize: theme.fontSize.small, color: theme.color.textMuted },
     sources: { flexDirection: "row", flexWrap: "wrap", gap: theme.spacing.xs },
+    compose: { gap: theme.spacing.sm },
     waiting: { gap: 2, padding: theme.spacing.sm },
     typing: { fontSize: theme.fontSize.small, fontStyle: "italic", color: theme.color.textMuted },
   });

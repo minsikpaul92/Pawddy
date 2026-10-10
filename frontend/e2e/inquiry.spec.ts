@@ -281,16 +281,13 @@ test.describe("sitter inquiry", () => {
     expect(db.inquiry_messages.find((m) => m.author === "sitter")?.body).toBe("Hi Robert! Yes — pill at 2 PM works. $268.13 CAD total.");
   });
 
-  test("Regenerate and the intent chips ask for another draft (the newest one is shown)", async ({ page }) => {
+  test("Regenerate asks for another draft and the newest one is shown", async ({ page }) => {
     const { asked } = await openSitterThread(page);
     const screen = app(page);
     await screen.getByTestId(`inquiry-card-${INQ}`).click();
     await screen.getByTestId("inquiry-regenerate").click();
     await expect(screen.getByTestId("inquiry-draft-body")).toContainText("A fresh take");
     expect(asked[0]).toEqual({ inquiry_id: INQ, regenerate: true });
-    await screen.getByTestId("inquiry-intent-decline").click();
-    await expect(screen.getByTestId("inquiry-draft-body")).toContainText("I can't this time");
-    expect(asked[1]).toEqual({ inquiry_id: INQ, regenerate: true, intent: "decline" });
   });
 
   test("with no draft yet the sitter sees it is being written and can write it themselves", async ({ page }) => {
@@ -339,8 +336,8 @@ test.describe("auto-send", () => {
     seedThread(db);
     // The AI draft is the sitter's; the auto reply is stored now but only appears at visible_at.
     const now = Date.now();
-    const visible = new Date(now + 7000).toISOString();
-    db.inquiries[0].reply_typing_at = new Date(now + 2000).toISOString();
+    const visible = new Date(now + 12000).toISOString();
+    db.inquiries[0].reply_typing_at = new Date(now + 6000).toISOString();
     db.inquiries[0].reply_visible_at = visible;
     db.inquiry_messages.push({
       id: "auto1", inquiry_id: INQ, author: "sitter", sender_id: SITTER.id, status: "sent", drafted_by_ai: true, confirmed_by_sitter_at: null,
@@ -353,8 +350,8 @@ test.describe("auto-send", () => {
     const screen = app(page);
 
     await expect(screen.getByTestId("inquiry-waiting")).toContainText("will reply soon");
-    await expect(screen.getByTestId("inquiry-typing")).toHaveText("Chloe is typing…", { timeout: 6000 });
-    await expect(screen.getByTestId("inquiry-reply-bubble")).toContainText("268.13", { timeout: 9000 });
+    await expect(screen.getByTestId("inquiry-typing")).toHaveText("Chloe is typing…", { timeout: 9000 });
+    await expect(screen.getByTestId("inquiry-reply-bubble")).toContainText("268.13", { timeout: 12000 });
     await expect(screen.getByTestId("inquiry-typing")).toHaveCount(0);
     // Nobody has opened the thread: no "Read", whatever the screen was doing.
     await expect(screen.getByTestId("inquiry-question-bubble")).not.toContainText("Read");
@@ -433,5 +430,259 @@ test.describe("owner questions list", () => {
     await screen.getByTestId("question-card-inq-b").click();
     await expect(page).toHaveURL(/\/owner\/inquiries\/inq-b$/);
     await expect(screen.getByTestId("inquiry-reply-bubble")).toContainText("Yes!");
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// FB-34: the owner writes again, Change dates, and "replied" follows the latest owner message
+// ---------------------------------------------------------------------------------------------
+
+const SENT_REPLY = {
+  id: "reply1", inquiry_id: INQ, author: "sitter", sender_id: SITTER.id, status: "sent", drafted_by_ai: true,
+  body: "Hi Robert! I can't take Max that weekend.", visible_at: "2026-10-06T10:05:00Z", read_at: null,
+  created_at: "2026-10-06T10:05:00Z", confirmed_by_sitter_at: "2026-10-06T10:05:00Z",
+  grounding: { quote: null, sources: [], availability: { can_host: false } },
+};
+
+async function openOwnerThread(page: import("@playwright/test").Page, reply: Record<string, unknown> = SENT_REPLY) {
+  const { db } = await mockSupabase(page, [OWNER, SITTER]);
+  seedThread(db);
+  db.inquiry_messages.push(reply);
+  const asked: Record<string, unknown>[] = [];
+  await page.route("**/api/ai/inquiry-reply", (route) => {
+    asked.push(route.request().postDataJSON());
+    return route.fulfill({ status: 200, contentType: "application/json", body: "{}" });
+  });
+  await signIn(page, OWNER);
+  await expect(page).toHaveURL(/\/owner$/);
+  await page.goto(`/owner/inquiries/${INQ}`);
+  return { db, asked };
+}
+
+test.describe("owner follow-up (FB-34)", () => {
+  test("the thread shows every message in order; writing back adds the message and asks for a new draft", async ({ page }) => {
+    const { db, asked } = await openOwnerThread(page);
+    const screen = app(page);
+    await expect(screen.getByTestId("inquiry-question-bubble")).toHaveCount(1);
+    await expect(screen.getByTestId("inquiry-reply-bubble")).toContainText("can't take Max");
+    await expect(screen.getByTestId("inquiry-compose")).toBeVisible();
+
+    await screen.getByTestId("inquiry-followup").fill("What about the weekend after?");
+    await screen.getByTestId("inquiry-followup-send").click();
+
+    await expect(screen.getByTestId("inquiry-question-bubble")).toHaveCount(2);
+    await expect(screen.getByTestId("inquiry-question-bubble").last()).toContainText("weekend after");
+    expect(db.inquiry_messages.filter((m) => m.author === "owner").at(-1)).toMatchObject({
+      sender_id: OWNER.id, body: "What about the weekend after?",
+    });
+    expect(asked).toEqual([{ inquiry_id: INQ }]);
+    // Waiting for the sitter again: no reply box, no stale buttons from the earlier answer.
+    await expect(screen.getByTestId("inquiry-waiting")).toBeVisible();
+    await expect(screen.getByTestId("inquiry-compose")).toHaveCount(0);
+    await expect(screen.getByTestId("inquiry-change-dates")).toHaveCount(0);
+  });
+
+  test("a declined reply offers Change dates first and Find other sitters second; Change dates moves the dates of the same thread", async ({ page }) => {
+    const { db, asked } = await openOwnerThread(page);
+    const screen = app(page);
+    await expect(screen.getByTestId("inquiry-change-dates")).toBeVisible();
+    await expect(screen.getByTestId("inquiry-find-others")).toBeVisible();
+    const before = String(db.inquiries[0].drop_off_at);
+    await screen.getByTestId("inquiry-change-dates").click();
+
+    await expect(screen.getByTestId("inquiry-sheet")).toBeVisible();
+    await expect(screen.getByText("Change dates").first()).toBeVisible();
+    await expect(screen.getByTestId("inquiry-pet-Max")).toHaveCount(0); // the pets stay as asked
+    // Move the drop-off a day later: the pick-up moves with it (same length of stay).
+    const dropDay = await screen.getByTestId("drop_off-day-value").innerText();
+    const pickDay = await screen.getByTestId("pick_up-day-value").innerText();
+    await screen.getByTestId("drop_off-day-plus").click();
+    await expect(screen.getByTestId("drop_off-day-value")).not.toHaveText(dropDay);
+    await expect(screen.getByTestId("pick_up-day-value")).not.toHaveText(pickDay);
+    await screen.getByTestId("inquiry-send").click();
+
+    // Still one inquiry, same URL: the conversation goes on.
+    await expect(screen.getByTestId("inquiry-waiting")).toBeVisible();
+    await expect(page).toHaveURL(new RegExp(`/owner/inquiries/${INQ}`));
+    expect(db.inquiries).toHaveLength(1);
+    expect(db.inquiries[0].id).toBe(INQ);
+    expect(Date.parse(String(db.inquiries[0].drop_off_at))).toBe(Date.parse(before) + 86_400_000);
+    const mine = db.inquiry_messages.filter((m) => m.author === "owner");
+    expect(String(mine.at(-1)?.body)).toMatch(/^Changed dates: /);
+    expect(asked).toEqual([{ inquiry_id: INQ }]);
+    await expect(screen.getByTestId("inquiry-question-bubble").last()).toContainText("Changed dates");
+  });
+
+  test("the sitter's list and thread follow the latest owner message: a reply, then a new question, needs an answer again", async ({ page }) => {
+    const { db } = await mockSupabase(page, [OWNER, SITTER]);
+    seedThread(db);
+    // The draft was sent; then the owner wrote again after it.
+    db.inquiry_messages.push(
+      { ...SENT_REPLY, id: "reply1" },
+      { id: "q2", inquiry_id: INQ, author: "owner", sender_id: OWNER.id, body: "What about the weekend after?", status: "sent", drafted_by_ai: false, visible_at: "2026-10-06T11:00:00Z", read_at: null, created_at: "2026-10-06T11:00:00Z", grounding: null },
+    );
+    await signIn(page, SITTER);
+    await app(page).getByRole("heading", { name: "Home" }).waitFor();
+    await page.goto("/sitter/bookings");
+    await app(page).getByTestId("sitter-bookings-tabs-inquiries").click();
+    const screen = app(page);
+    await expect(screen.getByTestId("sitter-bookings-tabs-inquiries-count")).toHaveText("1");
+    await expect(screen.getByTestId(`inquiry-card-${INQ}`)).toContainText("Writing the draft");
+
+    // The draft for the new message lands: the card says so, and the thread offers it (the old draft stays out).
+    db.inquiry_messages.push({
+      id: "draft2", inquiry_id: INQ, author: "ai", sender_id: null, body: "Hi Robert! The weekend after works.", status: "draft", drafted_by_ai: true,
+      visible_at: "2026-10-06T11:00:05Z", read_at: null, created_at: "2026-10-06T11:00:05Z",
+      grounding: { quote: null, sources: [], availability: { can_host: true }, needs_sitter: false, intent: null },
+    });
+    await page.reload();
+    await app(page).getByTestId("sitter-bookings-tabs-inquiries").click();
+    await expect(screen.getByTestId(`inquiry-card-${INQ}`)).toContainText("Draft ready");
+    await screen.getByTestId(`inquiry-card-${INQ}`).click();
+    await expect(screen.getByTestId("inquiry-draft-body")).toContainText("weekend after works");
+    await expect(screen.getByTestId("inquiry-replied")).toHaveCount(0);
+    await screen.getByTestId("inquiry-send").click();
+    await expect(screen.getByTestId("toast")).toContainText("Sent");
+    await expect(screen.getByTestId("inquiry-replied")).toBeVisible();
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// FB-34 follow-ups from the 2026-10-10 local run: stamps, live threads, source chips, no-room drafts
+// ---------------------------------------------------------------------------------------------
+
+test.describe("inquiry thread polish (FB-34)", () => {
+  test("message times read like Oct 6, 10:05 AM, and another year adds the year", async ({ page }) => {
+    await openOwnerThread(page, { ...SENT_REPLY, created_at: "2031-02-03T15:05:00Z" });
+    const screen = app(page);
+    await expect(screen.getByTestId("inquiry-question-bubble")).toContainText("Oct 6, 6:00 AM"); // this year: no year
+    await expect(screen.getByTestId("inquiry-question-bubble")).not.toContainText("2026");
+    await expect(screen.getByTestId("inquiry-reply-bubble")).toContainText("Feb 3, 2031, 10:05 AM");
+    await expect(screen.getByTestId("inquiry-reply-bubble")).not.toContainText("02-03");
+  });
+
+  test("a sitter reply shows on the owner's open thread, and an owner message on the sitter's, with no reload", async ({ browser }) => {
+    const ownerPage = await browser.newPage();
+    const { db } = await openOwnerThread(ownerPage, { ...SENT_REPLY, id: "reply0" });
+    await expect(app(ownerPage).getByTestId("inquiry-reply-bubble")).toHaveCount(1);
+    db.inquiry_messages.push({
+      ...SENT_REPLY, id: "reply-live", body: "One more thing: I can do the 14th!",
+      visible_at: new Date().toISOString(), created_at: new Date(Date.now() + 1000).toISOString(),
+    });
+    await expect(app(ownerPage).getByTestId("inquiry-reply-bubble")).toHaveCount(2, { timeout: 12000 });
+    await expect(app(ownerPage).getByTestId("inquiry-reply-bubble").last()).toContainText("the 14th");
+    await ownerPage.close();
+
+    const sitterPage = await browser.newPage();
+    const mock = await mockSupabase(sitterPage, [OWNER, SITTER]);
+    seedThread(mock.db);
+    await signIn(sitterPage, SITTER);
+    await app(sitterPage).getByRole("heading", { name: "Home" }).waitFor();
+    await sitterPage.goto(`/sitter/inquiries/${INQ}`);
+    await expect(app(sitterPage).getByTestId("inquiry-message-owner")).toHaveCount(1);
+    mock.db.inquiry_messages.push({
+      id: "q-live", inquiry_id: INQ, author: "owner", sender_id: OWNER.id, body: "Are you free the 14th too?", status: "sent",
+      drafted_by_ai: false, visible_at: new Date().toISOString(), read_at: null, created_at: new Date(Date.now() + 2000).toISOString(), grounding: null,
+    });
+    await expect(app(sitterPage).getByTestId("inquiry-message-owner")).toHaveCount(2, { timeout: 12000 });
+    // The new message is marked read the moment it is on the sitter's screen.
+    await expect.poll(() => mock.db.inquiry_messages.find((m) => m.id === "q-live")?.read_at, { timeout: 12000 }).toBeTruthy();
+    await sitterPage.close();
+  });
+
+  test("the earlier-messages source is not shown to the owner or the sitter", async ({ page }) => {
+    const sources = [
+      { id: "earlier-0", type: "inquiry", label: "From your earlier messages", text: "x" },
+      { id: "policy-0", type: "sitter_policy", label: "From Chloe's policies", text: "y" },
+    ];
+    await openOwnerThread(page, { ...SENT_REPLY, grounding: { quote: null, sources, availability: { can_host: true } } });
+    await expect(app(page).getByTestId("inquiry-sources")).toContainText("From Chloe's policies");
+    await expect(app(page).getByTestId("inquiry-sources")).not.toContainText("earlier messages");
+  });
+
+  test("a draft for dates with no room says why, and Accept explains instead of sending a yes", async ({ page }) => {
+    await openSitterThread(page, { grounding: { quote: null, sources: [], availability: { can_host: false }, needs_sitter: false, intent: null } });
+    const screen = app(page);
+    await screen.getByTestId(`inquiry-card-${INQ}`).click();
+    await expect(screen.getByTestId("inquiry-no-room")).toContainText("no room");
+    await screen.getByTestId("inquiry-intent-accept").click();
+    await expect(screen.getByTestId("reply-no-room")).toContainText("no room");
+    await expect(screen.getByTestId("reply-send")).toHaveCount(0);
+    await expect(screen.getByTestId("reply-open-schedule")).toBeVisible();
+  });
+});
+
+test.describe("sitter lands on what is waiting (FB-34)", () => {
+  test("Home shows the waiting question, and Bookings opens on Questions when nothing else needs an answer", async ({ page }) => {
+    const { db } = await mockSupabase(page, [OWNER, SITTER]);
+    seedThread(db);
+    await signIn(page, SITTER);
+    const screen = app(page);
+    await expect(screen.getByTestId("today-questions")).toContainText("Questions (1)");
+    await screen.getByTestId("today-questions").click();
+    await expect(page).toHaveURL(/\/sitter\/bookings/);
+    // No tab tap needed: the Questions list is already open.
+    await expect(screen.getByTestId(`inquiry-card-${INQ}`)).toBeVisible();
+    // Once answered, the banner is gone.
+    db.inquiry_messages.push({ ...SENT_REPLY, id: "answered", created_at: "2026-10-06T10:30:00Z" });
+    await page.goto("/sitter");
+    await expect(screen.getByRole("heading", { name: "Home" })).toBeVisible();
+    await expect(screen.getByTestId("today-questions")).toHaveCount(0);
+  });
+});
+
+test.describe("sitter quick replies (FB-34)", () => {
+  test("Accept writes the reply in a popup; confirming sends it with the quote", async ({ page }) => {
+    const { db, asked } = await openSitterThread(page);
+    const screen = app(page);
+    await screen.getByTestId(`inquiry-card-${INQ}`).click();
+    await screen.getByTestId("inquiry-intent-accept").click();
+    await expect(screen.getByTestId("reply-text")).toHaveValue(/A fresh take/, { timeout: 8000 });
+    expect(asked.at(-1)).toEqual({ inquiry_id: INQ, regenerate: true, intent: "accept" });
+    await screen.getByTestId("reply-send").click();
+    await expect(screen.getByTestId("inquiry-replied")).toBeVisible();
+    const sent = db.inquiry_messages.find((m) => m.author === "sitter");
+    expect(sent).toMatchObject({ drafted_by_ai: true, sender_id: SITTER.id });
+    expect((sent?.grounding as { quote: { total: number } }).quote.total).toBe(268.13);
+    expect((sent?.grounding as { availability: { can_host: boolean } }).availability.can_host).toBe(true);
+  });
+
+  test("Decline writes a decline in a popup; confirming sends it as a no, with no quote", async ({ page }) => {
+    const { db, asked } = await openSitterThread(page);
+    const screen = app(page);
+    await screen.getByTestId(`inquiry-card-${INQ}`).click();
+    await screen.getByTestId("inquiry-intent-decline").click();
+    await expect(screen.getByTestId("reply-text")).toHaveValue(/I can't this time/, { timeout: 8000 });
+    expect(asked.at(-1)).toEqual({ inquiry_id: INQ, regenerate: true, intent: "decline" });
+    await screen.getByTestId("reply-text").fill("Hi Robert! Sorry, I can't that week.");
+    await screen.getByTestId("reply-send").click();
+    await expect(screen.getByTestId("inquiry-replied")).toBeVisible();
+    const sent = db.inquiry_messages.find((m) => m.author === "sitter");
+    expect(sent?.body).toBe("Hi Robert! Sorry, I can't that week.");
+    expect(sent?.grounding).toEqual({ availability: { can_host: false } });
+  });
+
+  test("Suggest other dates: pick the days, the message carries them, confirming sends it as a no for the asked dates", async ({ page }) => {
+    const { db } = await openSitterThread(page);
+    const screen = app(page);
+    await screen.getByTestId(`inquiry-card-${INQ}`).click();
+    await screen.getByTestId("inquiry-intent-suggest").click();
+    await expect(screen.getByTestId("handoff-drop_off")).toBeVisible();
+    await expect(screen.getByTestId("reply-text")).toHaveValue(/I can host Max from .+ to .+\. Would that work/);
+    await screen.getByTestId("reply-send").click();
+    await expect(screen.getByTestId("inquiry-replied")).toBeVisible();
+    const sent = db.inquiry_messages.find((m) => m.author === "sitter");
+    expect(sent?.drafted_by_ai).toBe(false);
+    expect(sent?.grounding).toEqual({ availability: { can_host: false } });
+  });
+
+  test("Suggest other dates won't send days the sitter has no room for", async ({ page }) => {
+    const { db } = await openSitterThread(page);
+    db.stayShortfall = "2030-10-20 overnight";
+    const screen = app(page);
+    await screen.getByTestId(`inquiry-card-${INQ}`).click();
+    await screen.getByTestId("inquiry-intent-suggest").click();
+    await expect(screen.getByTestId("reply-problem")).toContainText("no room");
+    await expect(screen.getByTestId("reply-send")).toBeDisabled();
   });
 });

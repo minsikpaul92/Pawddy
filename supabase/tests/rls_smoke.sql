@@ -3383,4 +3383,91 @@ begin
 end;
 $$;
 
+-- ---------------------------------------------------------------------------
+-- Same-thread date change (011j) and the sitter's reply outcome (011k), FB-34
+-- ---------------------------------------------------------------------------
+
+do $$
+declare
+  kai constant uuid := '00000000-0000-4000-8000-0000000000aa';
+  lou constant uuid := '00000000-0000-4000-8000-0000000000ba';
+  kip constant uuid := '00000000-0000-4000-8000-0000000000ca';
+  v_inq uuid;
+  v_draft uuid;
+  v_err text;
+  v_msg public.inquiry_messages;
+begin
+  perform _t_as(null);
+  insert into auth.users (id, email, raw_user_meta_data) values
+    (kai, 'kai@example.test', '{"role":"owner","display_name":"Kai"}'),
+    (lou, 'lou@example.test', '{"role":"sitter","display_name":"Lou"}');
+  insert into public.pets (id, owner_id, species, name) values (kip, kai, 'dog', 'Kip');
+
+  perform _t_as(kai);
+  insert into public.inquiries (owner_id, sitter_id, drop_off_at, pick_up_at, pet_ids)
+  values (kai, lou, now() + interval '5 days', now() + interval '7 days', array[kip]) returning id into v_inq;
+  insert into public.inquiry_messages (inquiry_id, author, sender_id, body) values (v_inq, 'owner', kai, 'Can you host Kip?');
+
+  -- 011j: the owner moves the dates in the same thread; one owner message records it.
+  v_msg := public.change_inquiry_dates(v_inq, now() + interval '20 days', now() + interval '22 days', 'owner_home', null, 'Changed dates');
+  perform _t_ok(v_msg.author = 'owner' and v_msg.inquiry_id = v_inq and v_msg.body = 'Changed dates', '011j: the change leaves an owner message in the thread');
+  perform _t_ok((select drop_off_at from public.inquiries where id = v_inq) > now() + interval '19 days', '011j: the inquiry has the new drop-off');
+  perform _t_ok((select drop_off_location_type from public.inquiries where id = v_inq) = 'owner_home', '011j: …a given place is changed');
+  perform _t_ok((select pick_up_location_type from public.inquiries where id = v_inq) = 'sitter_home', '011j: …a null place is kept');
+  perform _t_ok((select count(*) from public.inquiries where owner_id = kai) = 1, '011j: still one inquiry (the thread continues)');
+
+  v_err := null;
+  begin
+    perform public.change_inquiry_dates(v_inq, now() + interval '22 days', now() + interval '20 days', null, null, 'x');
+  exception when others then v_err := sqlerrm; end;
+  perform _t_ok(v_err = 'invalid_window', '011j: a pick-up before the drop-off is refused');
+  v_err := null;
+  begin
+    perform public.change_inquiry_dates(v_inq, now() + interval '20 days', now() + interval '60 days', null, null, 'x');
+  exception when others then v_err := sqlerrm; end;
+  perform _t_ok(v_err = 'invalid_window', '011j: a trip over 31 days is refused');
+  v_err := null;
+  begin
+    perform public.change_inquiry_dates(v_inq, now() + interval '20 days', now() + interval '22 days', null, null, '   ');
+  exception when others then v_err := sqlerrm; end;
+  perform _t_ok(v_err = 'body_required', '011j: an empty message is refused');
+
+  perform _t_as(lou);
+  v_err := null;
+  begin
+    perform public.change_inquiry_dates(v_inq, now() + interval '20 days', now() + interval '22 days', null, null, 'x');
+  exception when others then v_err := sqlerrm; end;
+  perform _t_ok(v_err = 'forbidden', '011j: the sitter cannot change the owner''s dates');
+
+  -- 011k: the outcome the sitter chose decides what the owner sees.
+  perform _t_as(null);
+  insert into public.inquiry_messages (inquiry_id, author, sender_id, body, drafted_by_ai, status, grounding)
+  values (v_inq, 'ai', null, 'Yes! $100', true, 'draft',
+    '{"quote":{"total":100},"sources":[{"id":"policy-0"}],"availability":{"can_host":true}}') returning id into v_draft;
+
+  perform _t_as(lou);
+  v_msg := public.send_inquiry_reply(v_inq, 'Sorry, I cannot.', v_draft, 'decline');
+  perform _t_ok((v_msg.grounding #>> '{availability,can_host}') = 'false', '011k: a decline says can_host false');
+  perform _t_ok(v_msg.grounding -> 'quote' is null, '011k: …and carries no quote');
+  perform _t_ok(v_msg.drafted_by_ai and v_msg.confirmed_by_sitter_at is not null, '011k: …yet it is still the approved draft');
+  v_msg := public.send_inquiry_reply(v_inq, 'How about Nov 3?', null, 'suggest');
+  perform _t_ok((v_msg.grounding #>> '{availability,can_host}') = 'false' and not v_msg.drafted_by_ai, '011k: a suggestion says can_host false');
+  v_msg := public.send_inquiry_reply(v_inq, 'Yes, happy to!', v_draft, 'accept');
+  perform _t_ok((v_msg.grounding #>> '{quote,total}') = '100' and (v_msg.grounding #>> '{availability,can_host}') = 'true', '011k: an accept keeps the draft''s quote and availability');
+  v_msg := public.send_inquiry_reply(v_inq, 'Plain', v_draft);
+  perform _t_ok((v_msg.grounding #>> '{quote,total}') = '100', '011k: no outcome behaves as before');
+  v_err := null;
+  begin
+    perform public.send_inquiry_reply(v_inq, 'x', v_draft, 'maybe');
+  exception when others then v_err := sqlerrm; end;
+  perform _t_ok(v_err = 'invalid_outcome', '011k: an unknown outcome is refused');
+
+  -- The owner sees the decline without a quote.
+  perform _t_as(kai);
+  perform _t_ok((select count(*) from public.inquiry_messages where inquiry_id = v_inq and author = 'sitter') = 4, '011k: the owner sees the sent replies');
+  perform _t_ok(not exists (select 1 from public.inquiry_messages where inquiry_id = v_inq and body = 'Sorry, I cannot.' and grounding ? 'quote'), '011k: …the decline among them has no quote');
+  perform _t_as(null);
+end;
+$$;
+
 rollback;
